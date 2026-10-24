@@ -1,5 +1,6 @@
 name: Throne build matrix
 on:
+  push:
   workflow_dispatch:
     inputs:
       tag:
@@ -14,20 +15,61 @@ env:
   # A THRONE_API_REF repository variable overrides it.
   THRONE_API_REF: ${{ vars.THRONE_API_REF || '48b1d5354d121d41897cebc5fd48de01886d5287' }}
 jobs:
-  lint:
+  resolve-version:
+    name: Resolve build version
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      publish: ${{ steps.version.outputs.publish }}
     steps:
-      - name: Checking out sources
+      - name: Checking out sources and tags
         uses: actions/checkout@v7.0.1
-      - name: Checking the engine/UI boundary
-        run: cmake -DROOT=${{ github.workspace }} -P cmake/EngineBoundary.cmake
-      - name: Checking the changelog
-        if: github.event.inputs.publish == 'r' || github.event.inputs.publish == 'p'
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: bash
         env:
-          TAG: ${{ github.event.inputs.tag }}
-        run: bash ./script/release_notes.sh "$TAG" > /dev/null
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            # Only stable X.Y.Z tags are eligible as a base.
+            # Automatically generated X.Y.Z.1 tags are deliberately excluded.
+            BASE_TAG=$(
+              git tag --list --sort=-version:refname |
+                grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' |
+                head -n 1 || true
+            )
+
+            if [[ -z "$BASE_TAG" ]]; then
+              echo "::error::No stable version tag found (expected X.Y.Z or vX.Y.Z)."
+              exit 1
+            fi
+
+            TAG="${BASE_TAG}.1"
+            PUBLISH="p"
+          else
+            TAG="$INPUT_TAG"
+            PUBLISH="${INPUT_PUBLISH:-}"
+          fi
+
+          if [[ -z "$TAG" ]]; then
+            echo "::error::The build tag is empty."
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+
+          echo "Build tag: $TAG"
+          echo "Publish mode: ${PUBLISH:-disabled}"
   build-go:
     permissions:
       contents: read
@@ -186,8 +228,8 @@ jobs:
     permissions:
       contents: read
     needs:
-      - lint
       - build-go
+      - resolve-version
     strategy:
       matrix:
         include:
@@ -263,7 +305,7 @@ jobs:
       fail-fast: false
     runs-on: ${{ matrix.platform }}
     env:
-      INPUT_VERSION: ${{ github.event.inputs.tag }}
+      INPUT_VERSION: ${{ needs.resolve-version.outputs.tag }}
       DEST: ${{ github.workspace }}/deployment/${{ matrix.dest_suffix }}
       DEST_SUFFIX: ${{ matrix.dest_suffix }}
       ARCH: ${{ matrix.target }}
@@ -395,6 +437,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs:
       - build-cpp
+      - resolve-version
     permissions:
       contents: read
     timeout-minutes: 20
@@ -446,6 +489,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs:
       - build-cpp
+      - resolve-version
     permissions:
       contents: read
     strategy:
@@ -515,7 +559,7 @@ jobs:
         run: CGO_ENABLED=0 GOOS=linux GOARCH="${TARGET#linux-}" go build -trimpath -ldflags "-s -w" -o "$THRONECTL" ./cmd/thronectl
       - name: Pack
         shell: bash
-        run: bash ./script/pack_release.sh ${{ matrix.target }} "${{ github.event.inputs.tag }}"
+        run: bash ./script/pack_release.sh ${{ matrix.target }} "${{ needs.resolve-version.outputs.tag }}"
       # Pins each build's glibc floor: a build image bump that raises it fails here, not in an older system's loader.
       - name: Checking glibc symbol versions
         if: matrix.glibc
@@ -567,6 +611,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs:
       - pack
+      - resolve-version
     permissions:
       contents: read
     timeout-minutes: 15
@@ -592,8 +637,8 @@ jobs:
       - name: Installing and running the package
         shell: bash
         env:
-          TAG: ${{ github.event.inputs.tag }}
-          DEB: Throne-${{ github.event.inputs.tag }}-${{ matrix.deb }}.deb
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+          DEB: Throne-${{ needs.resolve-version.outputs.tag }}-${{ matrix.deb }}.deb
           IMAGE: ${{ matrix.image }}
         run: |
           if [ ! -f "download-artifact/$DEB" ]; then
@@ -636,13 +681,14 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - pack
+      - resolve-version
     permissions:
       contents: read
       packages: write
     timeout-minutes: 45
     env:
-      TAG: ${{ github.event.inputs.tag }}
-      PUBLISH: ${{ github.event.inputs.publish }}
+      TAG: ${{ needs.resolve-version.outputs.tag }}
+      PUBLISH: ${{ needs.resolve-version.outputs.publish }}
       CONTEXT: ${{ github.workspace }}/docker-context
     steps:
       - name: Checking out sources
@@ -813,6 +859,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs:
       - pack
+      - resolve-version
     if: ${{ !cancelled() && needs.pack.result != 'skipped' }}
     permissions:
       contents: read
@@ -821,7 +868,7 @@ jobs:
       THRONECTL: ${{ github.workspace }}/throne-api/thronectl
       FIXTURES: ${{ github.workspace }}/script/ci/smoke_fixtures.py
       E2E_TMP: ${{ github.workspace }}/e2e-tmp
-      DEB: ${{ github.workspace }}/download-artifact/Throne-${{ github.event.inputs.tag }}-debian-amd64.deb
+      DEB: ${{ github.workspace }}/download-artifact/Throne-${{ needs.resolve-version.outputs.tag }}-debian-amd64.deb
     steps:
       - name: Checking the Throne-api ref is pushed
         run: |
@@ -876,6 +923,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs:
       - build-cpp
+      - resolve-version
     if: ${{ !cancelled() && needs.build-cpp.result != 'skipped' }}
     permissions:
       contents: read
@@ -947,6 +995,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     needs:
       - pack
+      - resolve-version
     if: ${{ !cancelled() && needs.pack.result != 'skipped' }}
     permissions:
       contents: read
@@ -955,8 +1004,8 @@ jobs:
       THRONECTL: ${{ github.workspace }}/throne-api/thronectl
       FIXTURES: ${{ github.workspace }}/script/ci/smoke_fixtures.py
       E2E_TMP: ${{ github.workspace }}/e2e-tmp
-      SYSTEMQT_DEB: ${{ github.workspace }}/download-artifact/Throne-${{ github.event.inputs.tag }}-debian-arm64-system-qt.deb
-      BUNDLED_DEB: ${{ github.workspace }}/download-artifact/Throne-${{ github.event.inputs.tag }}-debian-arm64.deb
+      SYSTEMQT_DEB: ${{ github.workspace }}/download-artifact/Throne-${{ needs.resolve-version.outputs.tag }}-debian-arm64-system-qt.deb
+      BUNDLED_DEB: ${{ github.workspace }}/download-artifact/Throne-${{ needs.resolve-version.outputs.tag }}-debian-arm64.deb
     steps:
       - name: Checking the Throne-api ref is pushed
         run: |
@@ -1010,6 +1059,7 @@ jobs:
     runs-on: macos-latest
     needs:
       - build-cpp
+      - resolve-version
     if: ${{ !cancelled() && needs.build-cpp.result != 'skipped' }}
     permissions:
       contents: read
@@ -1074,6 +1124,7 @@ jobs:
     runs-on: windows-latest
     needs:
       - build-cpp
+      - resolve-version
     if: ${{ !cancelled() && needs.build-cpp.result != 'skipped' }}
     permissions:
       contents: read
@@ -1155,6 +1206,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - pack
+      - resolve-version
     permissions:
       contents: write
       actions: read
@@ -1177,207 +1229,49 @@ jobs:
         run: |
           curl -Lo - https://github.com/tcnksm/ghr/releases/download/v0.17.0/ghr_v0.17.0_linux_amd64.tar.gz | tar xzv
           mv ghr*linux_amd64/ghr .
-      - name: Generating release notes
-        if: github.event.inputs.publish == 'r' || github.event.inputs.publish == 'p'
+      # - name: Generating release notes
+      #   if: github.event_name == 'push' || env.BUILD_PUBLISH == 'r' || env.BUILD_PUBLISH == 'p'
+      #   env:
+      #     TAG: ${{ needs.resolve-version.outputs.tag }}
+      #     REPO: ${{ github.repository }}
+      #   run: |
+      #     {
+      #       bash ./script/release_notes.sh "$TAG"
+      #       echo
+      #       sed "s|{{TAG}}|$TAG|g; s|{{REPO}}|$REPO|g" .github/release_template.md
+      #     } > "$RUNNER_TEMP/release.md"
+      - name: Updating Git tag for push builds
+        if: github.event_name == 'push'
+        shell: bash
         env:
-          TAG: ${{ github.event.inputs.tag }}
-          REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
         run: |
-          {
-            bash ./script/release_notes.sh "$TAG"
-            echo
-            sed "s|{{TAG}}|$TAG|g; s|{{REPO}}|$REPO|g" .github/release_template.md
-          } > "$RUNNER_TEMP/release.md"
+          set -euo pipefail
+
+          # Repeated pushes reuse the same version based on the latest stable tag.
+          # Move the generated tag to the current commit.
+          git fetch --tags --force
+          git tag -f "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG" --force
+
+      - name: Installing ghr
+        run: |
+          curl -fLo ghr.tar.gz https://github.com/tcnksm/ghr/releases/download/v0.17.0/ghr_v0.17.0_linux_amd64.tar.gz
+          tar xzf ghr.tar.gz
+          mv ghr*linux_amd64/ghr .
+
       - name: PreRelease
-        if: github.event.inputs.publish == 'p'
+        if: needs.resolve-version.outputs.publish == 'p'
+        env:
+          TAG: ${{ needs.resolve-version.outputs.tag }}
         run: |
-          ./ghr -prerelease -delete -c ${{ github.sha }} -t "${{ github.token }}" -n "${{ github.event.inputs.tag }}" -b "$(cat "$RUNNER_TEMP/release.md")" "${{ github.event.inputs.tag }}" deployment
+          ./ghr -prerelease -delete -c "$GITHUB_SHA" -t "${{ github.token }}" \
+            -n "$TAG" -b "$(cat .github/release_template.md)" "$TAG" deployment
+
       - name: Release
-        if: github.event.inputs.publish == 'r'
-        run: |
-          ./ghr -delete -c ${{ github.sha }} -t "${{ github.token }}" -n "${{ github.event.inputs.tag }}" -b "$(cat "$RUNNER_TEMP/release.md")" "${{ github.event.inputs.tag }}" deployment
-  # Updates the AUR package after a stable release.
-  publish-aur:
-    name: Publish AUR Package
-    runs-on: ubuntu-latest
-    needs:
-      - publish
-    if: github.event.inputs.publish == 'r'
-    permissions:
-      contents: read
-    steps:
-      - name: Checking out sources
-        uses: actions/checkout@v7.0.1
-      - name: Validate version and update PKGBUILD
-        run: |
-          VERSION="${{ github.event.inputs.tag }}"
-          if ! [[ "$VERSION" =~ ^[0-9A-Za-z._+]+$ ]]; then
-            echo "::error::Cannot publish '$VERSION' to AUR: not a valid pkgver. AUR is only updated for stable releases (publish=r)."
-            exit 1
-          fi
-          sed -i "s/^pkgver=.*/pkgver=${VERSION}/;s/^pkgrel=.*/pkgrel=1/" dist/aur/PKGBUILD
-      - name: Publish to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
-        with:
-          pkgname: throne
-          asset_dir: dist/aur
-          updpkgsums: true
-          commit_username: throneproj-bot
-          commit_email: throneproj-bot@users.noreply.github.com
-          commit_message: Update to ${{ github.event.inputs.tag }}
-          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-  # Updates the cask in throneproj/homebrew-tap after a stable release.
-  publish-homebrew:
-    name: Publish Homebrew Cask
-    runs-on: ubuntu-latest
-    needs:
-      - publish
-    if: github.event.inputs.publish == 'r'
-    permissions:
-      contents: read
-    steps:
-      - name: Checking out sources
-        uses: actions/checkout@v7.0.1
-      - name: Download macOS artifacts
-        uses: actions/download-artifact@v8.0.1
-        with:
-          name: Pack-${{ github.sha }}-macos
-          path: deployment
-      - name: Checking out tap
-        uses: actions/checkout@v7.0.1
-        with:
-          repository: throneproj/homebrew-tap
-          ssh-key: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
-          path: tap
-      - name: Update cask
+        if: needs.resolve-version.outputs.publish == 'r'
         env:
-          VERSION: ${{ github.event.inputs.tag }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
         run: |
-          set -euo pipefail
-          if ! [[ "$VERSION" =~ ^[0-9A-Za-z._+]+$ ]]; then
-            echo "::error::Cannot publish '$VERSION' to Homebrew: not a valid cask version."
-            exit 1
-          fi
-          ARM64="deployment/Throne-${VERSION}-macos-arm64.zip"
-          AMD64="deployment/Throne-${VERSION}-macos-amd64.zip"
-          test -f "$ARM64" && test -f "$AMD64"
-          mkdir -p tap/Casks
-          sed -e "s/@VERSION@/${VERSION}/" \
-            -e "s/@SHA256_ARM64@/$(sha256sum "$ARM64" | cut -d' ' -f1)/" \
-            -e "s/@SHA256_AMD64@/$(sha256sum "$AMD64" | cut -d' ' -f1)/" \
-            dist/homebrew/throne.rb > tap/Casks/throne.rb
-      - name: Push cask
-        working-directory: tap
-        env:
-          VERSION: ${{ github.event.inputs.tag }}
-        run: |
-          set -euo pipefail
-          git config user.name throneproj-bot
-          git config user.email throneproj-bot@users.noreply.github.com
-          git add Casks/throne.rb
-          if git diff --cached --quiet; then
-            echo "Cask already at $VERSION"
-            exit 0
-          fi
-          git commit -m "throne $VERSION"
-          git push
-  # Publishes the RPM and APT repositories to this repository's GitHub Pages,
-  # served at https://throneproj.github.io/Throne/rpm/ and
-  # https://throneproj.github.io/Throne/apt/.
-  publish-repos:
-    name: Publish RPM and APT Repositories
-    runs-on: ubuntu-latest
-    needs:
-      - publish
-    if: github.event.inputs.publish == 'r'
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    env:
-      # Must match the key in the REPO_SIGNING_KEY secret of the github-pages environment.
-      SIGNING_FPR: 5EEB21A857E9C485DBA5F4E000316AB4369049D6
-    steps:
-      - name: Download Linux artifacts
-        uses: actions/download-artifact@v8.0.1
-        with:
-          pattern: Pack-${{ github.sha }}-linux-*
-          merge-multiple: true
-          path: deployment
-      - name: Install packaging tools
-        run: sudo apt-get update -qq && sudo apt-get install -y createrepo-c dpkg-dev apt-utils rpm
-      - name: Import signing key
-        env:
-          REPO_SIGNING_KEY: ${{ secrets.REPO_SIGNING_KEY }}
-        run: |
-          set -euo pipefail
-          printf '%s\n' "$REPO_SIGNING_KEY" | gpg --batch --import
-          gpg --batch --list-secret-keys "$SIGNING_FPR" > /dev/null
-          mkdir -p repo
-          gpg --batch --armor --export "$SIGNING_FPR" > repo/throne.asc
-      - name: Build RPM repository
-        env:
-          VERSION: ${{ github.event.inputs.tag }}
-        run: |
-          set -euo pipefail
-          AMD64="deployment/Throne-${VERSION}-fedora-amd64-system-qt.rpm"
-          ARM64="deployment/Throne-${VERSION}-fedora-arm64-system-qt.rpm"
-          test -f "$AMD64" && test -f "$ARM64"
-          mkdir -p repo/rpm
-          cp "$AMD64" "$ARM64" repo/rpm/
-          # Signing rewrites the files, so it must run before createrepo_c checksums them.
-          rpmsign --addsign --define "_gpg_name $SIGNING_FPR" repo/rpm/*.rpm
-          createrepo_c repo/rpm
-          gpg --batch --yes --local-user "$SIGNING_FPR" --armor --detach-sign repo/rpm/repodata/repomd.xml
-          printf '%s\n' '[throne]' 'name=Throne RPM repository' \
-            'baseurl=https://throneproj.github.io/Throne/rpm' \
-            'enabled=1' 'autorefresh=1' 'gpgcheck=1' 'repo_gpgcheck=1' \
-            'gpgkey=https://throneproj.github.io/Throne/throne.asc' > repo/rpm/throne.repo
-      - name: Build APT repository
-        env:
-          VERSION: ${{ github.event.inputs.tag }}
-        run: |
-          set -euo pipefail
-          AMD64="deployment/Throne-${VERSION}-debian-amd64-system-qt.deb"
-          ARM64="deployment/Throne-${VERSION}-debian-arm64-system-qt.deb"
-          test -f "$AMD64" && test -f "$ARM64"
-          mkdir -p repo/apt/pool/main \
-            repo/apt/dists/stable/main/binary-amd64 \
-            repo/apt/dists/stable/main/binary-arm64
-          # dpkg-scanpackages --arch only picks up files named *_<arch>.deb.
-          cp "$AMD64" "repo/apt/pool/main/throne_${VERSION}_amd64.deb"
-          cp "$ARM64" "repo/apt/pool/main/throne_${VERSION}_arm64.deb"
-          cd repo/apt
-          for arch in amd64 arm64; do
-            dpkg-scanpackages --arch "$arch" pool /dev/null > "dists/stable/main/binary-${arch}/Packages"
-            gzip -k9 "dists/stable/main/binary-${arch}/Packages"
-          done
-          # Staged outside dists/stable, which apt-ftparchive scans, so Release does not list itself.
-          apt-ftparchive \
-            -o APT::FTPArchive::Release::Origin=throne \
-            -o APT::FTPArchive::Release::Label=Throne \
-            -o APT::FTPArchive::Release::Suite=stable \
-            -o APT::FTPArchive::Release::Codename=stable \
-            -o 'APT::FTPArchive::Release::Architectures=amd64 arm64' \
-            -o APT::FTPArchive::Release::Components=main \
-            -o 'APT::FTPArchive::Release::Description=Throne APT repository' \
-            release dists/stable > "$RUNNER_TEMP/Release"
-          mv "$RUNNER_TEMP/Release" dists/stable/Release
-          gpg --batch --yes --local-user "$SIGNING_FPR" --clearsign -o dists/stable/InRelease dists/stable/Release
-          gpg --batch --yes --local-user "$SIGNING_FPR" --armor --detach-sign -o dists/stable/Release.gpg dists/stable/Release
-          printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/throne.asc] https://throneproj.github.io/Throne/apt stable main' > throne.list
-          # deb822 multi-line field: every line indented, blank lines written as " .".
-          { printf '%s\n' 'Types: deb' \
-              'URIs: https://throneproj.github.io/Throne/apt' \
-              'Suites: stable' 'Components: main' 'Signed-By:'
-            sed 's/^$/./; s/^/ /' ../throne.asc; } > throne.sources
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v5.0.0
-        with:
-          path: repo
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5.0.1
+          ./ghr -delete -c "$GITHUB_SHA" -t "${{ github.token }}" \
+            -n "$TAG" -b "$(cat .github/release_template.md)" "$TAG" deployment

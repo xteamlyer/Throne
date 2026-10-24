@@ -1,0 +1,540 @@
+name: throned builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version shown by the application
+        required: false
+        default: dev
+      full_matrix:
+        description: Build all Linux architectures and Debian variants
+        required: false
+        type: boolean
+        default: false
+  pull_request:
+    
+concurrency:
+  group: throned-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast checks and updater tests report independently of the application builds.
+  # checks:
+  #   runs-on: ubuntu-22.04
+  #   steps:
+  #     # Full history: the translation check diffs against the base commit.
+  #     - uses: actions/checkout@v7.0.1
+  #       with:
+  #         fetch-depth: 0
+  #     - name: Lint Qt idioms
+  #       run: ./script/lint_qt_idioms.sh
+  #     - name: Check agent instructions
+  #       run: ./script/check_agents.sh
+  #     - name: Check translations
+  #       run: ./script/check_translations.sh "${{ github.event.pull_request.base.sha || github.event.before }}"
+  #     # Pinned deliberately: clang-format reformats differently between major
+  #     # versions, so an unpinned CI formatter disagrees with every workstation.
+  #     - name: Install clang-format
+  #       run: pip install "clang-format==19.1.5"
+  #     - name: Check formatting
+  #       run: ./script/format_cpp.sh --check
+  #     - uses: actions/setup-go@v6.5.0
+  #       with:
+  #         go-version: "1.27.0"
+  #         cache: false
+  #     - name: Test updater
+  #       working-directory: updater
+  #       run: |
+  #         go test ./...
+  #         go test -c -o ../out/build/updater.test .
+  #         sudo ../out/build/updater.test -test.run=^TestUpdateReplacesProtectedExecutables$ -test.v
+
+  core-windows:
+    runs-on: ubuntu-22.04
+    env:
+      DEST: ${{ github.workspace }}/deployment/windows-amd64
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/cache@v6.1.0
+        id: core-cache
+        with:
+          path: artifacts.tgz
+          key: throned-core-windows-amd64-go-1.27.0-${{ hashFiles('script/build_go.sh', 'core/**', 'updater/**') }}
+      - uses: actions/setup-go@v6.5.0
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        with:
+          go-version: "1.27.0"
+          cache-dependency-path: core/go.sum
+      - uses: arduino/setup-protoc@v3
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        with:
+          version: "31.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install protobuf generators
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+      - name: Build ThronedCore
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: GOOS=windows GOARCH=amd64 ./script/build_go.sh
+      - name: Pack core artifact
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: tar czf artifacts.tgz deployment
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: throned-core-windows-amd64
+          path: artifacts.tgz
+          compression-level: 0
+
+  core-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ (github.ref_type == 'tag' || inputs.full_matrix) && fromJSON('["amd64","arm64"]') || fromJSON('["amd64"]') }}
+    runs-on: ubuntu-22.04
+    env:
+      DEST: ${{ github.workspace }}/deployment/linux-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/cache@v6.1.0
+        id: core-cache
+        with:
+          path: artifacts.tgz
+          key: throned-core-linux-${{ matrix.arch }}-go-1.27.0-${{ hashFiles('script/build_go.sh', 'core/**', 'updater/**') }}
+      - uses: actions/setup-go@v6.5.0
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        with:
+          go-version: "1.27.0"
+          cache-dependency-path: core/go.sum
+      - uses: arduino/setup-protoc@v3
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        with:
+          version: "31.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install protobuf generators
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+      - uses: actions/cache@v6.1.0
+        id: cronet-cache
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        with:
+          path: ~/cronet-go
+          key: cronet-go-linux-${{ matrix.arch }}-9ed95366-v1
+      - name: Prepare Chromium toolchain
+        if: steps.core-cache.outputs.cache-hit != 'true' && steps.cronet-cache.outputs.cache-hit != 'true'
+        run: |
+          set -xeuo pipefail
+          git init "$HOME/cronet-go"
+          git -C "$HOME/cronet-go" remote add origin https://github.com/parhelia512/cronet-go.git
+          git -C "$HOME/cronet-go" fetch --depth=1 origin 9ed95366ae2f9b4b994cf54f8f9de0d8bc350057
+          git -C "$HOME/cronet-go" checkout FETCH_HEAD
+          git -C "$HOME/cronet-go" submodule update --init --recursive --depth=1
+          cd "$HOME/cronet-go"
+          go run ./cmd/build-naive --target=linux/${{ matrix.arch }} download-toolchain
+      - name: Load Chromium environment
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: |
+          set -xeuo pipefail
+          cd "$HOME/cronet-go"
+          go run ./cmd/build-naive --target=linux/${{ matrix.arch }} env >> "$GITHUB_ENV"
+      - name: Build ThronedCore
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: GOOS=linux GOARCH=${{ matrix.arch }} ./script/build_go.sh
+      - name: Pack core artifact
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        run: tar czf artifacts.tgz deployment
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: throned-core-linux-${{ matrix.arch }}
+          path: artifacts.tgz
+          compression-level: 0
+
+  windows:
+    needs: core-windows
+    runs-on: windows-latest
+    env:
+      INPUT_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version || 'dev' }}
+      DEST: ${{ github.workspace }}/deployment/windows-amd64
+      GITHUB_WORKSPACE: ${{ github.workspace }}
+      LAUNCHER_ARGS: -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          key: windows-amd64-qt-6.11.2
+          variant: sccache
+          max-size: 500M
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: throned-core-windows-amd64
+          path: download-artifact
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version: "1.27.0"
+          cache-dependency-path: core/go.sum
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "31.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # gen/*.pb.go is generated, not committed, and this job only downloads the
+      # built core, so the sources have to be produced before anything compiles.
+      - name: Generate core protobuf
+        shell: bash
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+          cd core/gen && protoc -I . --go_out=. --go-grpc_out=. libcore.proto
+      # The core is windows-only in places, so this is the job that can run its
+      # tests. winipcfg is vendored and its tests want an elevated host with real
+      # adapters, so they stay out.
+      - name: Test ThronedCore
+        shell: bash
+        run: cd core && go test $(go list ./... | grep -v /internal/boxdns/winipcfg)
+      - name: Test updater
+        working-directory: updater
+        run: go test ./...
+      - uses: actions/cache@v6.1.0
+        id: windows-deps
+        with:
+          path: |
+            qt.7z
+            openssl.7z
+          key: throned-windows-deps-qt-6.11.2-x64
+      - name: Download Qt and OpenSSL
+        if: steps.windows-deps.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -fLso qt.7z https://github.com/throneproj/buildqt/releases/download/Qt_6.11.2/Qt_6.11.2_x64.7z
+          curl -fLso openssl.7z https://github.com/throneproj/env_windows_legacy/releases/download/latest/openssl_x64.7z
+      - name: Build portable application
+        shell: bash
+        run: |
+          7z x qt.7z
+          7z x openssl.7z
+          export CMAKE_PREFIX_PATH="$PWD/Qt/lib/cmake"
+          export OPENSSL_ROOT_DIR="$PWD/openssl"
+          mkdir build
+          cd build
+          curl -fLso srslist.h https://raw.githubusercontent.com/throneproj/routeprofiles/rule-set/srslist.h
+          cmake -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTHRONED_PRECOMPILE_HEADERS=OFF -DTHRONED_UNITY_BUILD=OFF $LAUNCHER_ARGS ..
+          ninja throned-unit-tests
+          ctest --output-on-failure --no-tests=error -R '_tests$'
+          ninja
+          ctest --output-on-failure --no-tests=ignore -E '_tests$'
+          cd ..
+          ./script/deploy_windows.sh
+      # A screenshot is a function of the Qt build, the font files and the DPI of
+      # the host, so a runner cannot be compared against baselines recorded on a
+      # workstation. This renders the catalogue for a human to look at and never
+      # fails the build. The comparing gate is the pinned ui-snapshots job.
+      - name: Render UI scenario gallery
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          export PATH="$PWD/Qt/bin:$PWD/openssl:$PATH"
+          export QT_PLUGIN_PATH="$PWD/Qt/plugins"
+          cmake \
+            -DTHRONED_EXECUTABLE="$PWD/build/Throned.exe" \
+            -DOUTPUT_DIR="$PWD/ui-test-results/windows" \
+            -DSCENARIOS=all \
+            -DCOMPARE_BASELINES=OFF \
+            -P script/run_ui_scenarios.cmake
+      - name: Upload UI scenario gallery
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: throned-${{ github.sha }}-ui-scenarios-windows
+          path: ui-test-results
+          if-no-files-found: warn
+          compression-level: 6
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: throned-${{ github.sha }}-windows-amd64
+          path: deployment/windows-amd64
+
+  windows-installer:
+    if: github.ref_type != 'tag'
+    needs: windows
+    runs-on: ubuntu-22.04
+    env:
+      INPUT_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version || 'dev' }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: throned-${{ github.sha }}-windows-amd64
+          path: deployment/windows-amd64
+      - name: Build Windows installer artifact
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y nsis
+
+          safe_version="${INPUT_VERSION//[^[:alnum:]._-]/-}"
+          numeric_version="${INPUT_VERSION#v}"
+          numeric_version="${numeric_version#V}"
+          numeric_version="${numeric_version%%-*}"
+          IFS='.' read -r raw_major raw_minor raw_patch raw_build <<< "$numeric_version"
+
+          version_component() {
+            local value="${1:-0}"
+            if [[ "$value" =~ ^[0-9]+$ ]] && (( 10#$value <= 65535 )); then
+              echo "$((10#$value))"
+            else
+              echo 0
+            fi
+          }
+
+          major="$(version_component "${raw_major:-}")"
+          minor="$(version_component "${raw_minor:-}")"
+          patch="$(version_component "${raw_patch:-}")"
+          build="$(version_component "${raw_build:-}")"
+
+          makensis -NOCD \
+            -DTHRONED_X64_ONLY \
+            -DAPP_VERSION="$INPUT_VERSION" \
+            -DAPP_VERSION_MAJOR="$major" \
+            -DAPP_VERSION_MINOR="$minor" \
+            -DAPP_VERSION_PATCH="$patch" \
+            -DAPP_VERSION_BUILD="$build" \
+            -DOUTPUT_FILE="Throned-${safe_version}-windows64-installer.exe" \
+            script/windows_installer.nsi
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: throned-${{ github.sha }}-windows-installer
+          path: Throned-*-windows64-installer.exe
+
+  # Pixel comparison only holds where the Qt build, the fonts, the DPI and the
+  # platform plugin are identical on every machine that runs it. This job pins
+  # all four through script/ui_snapshot.sh and is the only place allowed to fail
+  # a pull request over a screenshot. Baselines are regenerated by running the
+  # same script with --update, never by copying a workstation screenshot.
+  ui-snapshots:
+    runs-on: ubuntu-22.04
+    env:
+      LAUNCHER_ARGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          key: ui-snapshots-qt-6.11.1
+          variant: ccache
+          max-size: 500M
+      - uses: jurplel/install-qt-action@v4.3.1
+        with:
+          version: "6.11.1"
+          setup-python: true
+          cache: true
+          cache-key-prefix: throned-ui-snapshots
+      - name: Install the pinned font set
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-dejavu-core libglx-dev libgl1-mesa-dev
+      - name: Build the application and the comparator
+        run: |
+          mkdir build
+          cd build
+          curl -fLso srslist.h https://raw.githubusercontent.com/throneproj/routeprofiles/rule-set/srslist.h
+          cmake -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTHRONED_PRECOMPILE_HEADERS=OFF -DTHRONED_UNITY_BUILD=OFF $LAUNCHER_ARGS ..
+          ninja Throned throned_snapshot_compare
+      - name: Compare UI snapshots
+        run: ./script/ui_snapshot.sh
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: throned-${{ github.sha }}-ui-snapshots
+          path: out/ui-scenarios
+          if-no-files-found: warn
+
+  linux:
+    needs: core-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ (github.ref_type == 'tag' || inputs.full_matrix) && fromJSON('[{"runner":"ubuntu-22.04","arch":"amd64","qt_arch":"x86_64","system_qt":false},{"runner":"ubuntu-22.04","arch":"amd64","qt_arch":"x86_64","system_qt":true},{"runner":"ubuntu-24.04-arm","arch":"arm64","qt_arch":"aarch64","system_qt":false},{"runner":"ubuntu-22.04-arm","arch":"arm64","qt_arch":"aarch64","system_qt":true}]') || fromJSON('[{"runner":"ubuntu-22.04","arch":"amd64","qt_arch":"x86_64","system_qt":false}]') }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      INPUT_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version || 'dev' }}
+      DEST_SUFFIX: linux-${{ matrix.arch }}${{ matrix.system_qt && '-system-qt' || '' }}
+      DEST: ${{ github.workspace }}/deployment/linux-${{ matrix.arch }}${{ matrix.system_qt && '-system-qt' || '' }}
+      GITHUB_WORKSPACE: ${{ github.workspace }}
+      ARCH: ${{ matrix.qt_arch }}
+      LAUNCHER_ARGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          key: linux-${{ matrix.arch }}-${{ matrix.system_qt && 'system-qt' || 'qt-6.11.1' }}
+          variant: ccache
+          max-size: 500M
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: throned-core-linux-${{ matrix.arch }}
+          path: download-artifact
+      - uses: jurplel/install-qt-action@v4.3.1
+        if: ${{ !matrix.system_qt }}
+        with:
+          version: "6.11.1"
+          setup-python: true
+          cache: true
+          cache-key-prefix: throned-linux-${{ matrix.arch }}
+      - name: Build portable application
+        if: ${{ !matrix.system_qt }}
+        run: |
+          mkdir build
+          cd build
+          curl -fLso srslist.h https://raw.githubusercontent.com/throneproj/routeprofiles/rule-set/srslist.h
+          cmake -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTHRONED_PRECOMPILE_HEADERS=OFF -DTHRONED_UNITY_BUILD=OFF -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" $LAUNCHER_ARGS ..
+          ninja
+          cd ..
+          ./script/deploy_linux64.sh
+      - name: Build system Qt application
+        if: ${{ matrix.system_qt }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev qt6-base-private-dev qt6-tools-dev qt6-tools-dev-tools qt6-l10n-tools libqt6svg6-dev qt6-translations-l10n libglx-dev libgl1-mesa-dev
+          mkdir build
+          cd build
+          curl -fLso srslist.h https://raw.githubusercontent.com/throneproj/routeprofiles/rule-set/srslist.h
+          cmake -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTHRONED_PRECOMPILE_HEADERS=OFF -DTHRONED_UNITY_BUILD=OFF -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc" $LAUNCHER_ARGS ..
+          ninja
+          cd ..
+          ./script/deploy_linux64_system_qt.sh
+      # Packaged here rather than in `release`: each matrix entry already holds
+      # its own build, so four jobs do in parallel what one job used to do
+      # serially after installing fpm.
+      - name: Pack deb and rpm
+        if: github.ref_type == 'tag'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm ruby-dev build-essential
+          sudo gem install -n /usr/local/bin --no-document fpm
+          mkdir -p packages
+          SYSTEMQT=""
+          NAME_SUFFIX=""
+          if [[ "${{ matrix.system_qt }}" == "true" ]]; then
+            SYSTEMQT="systemqt"
+            NAME_SUFFIX="-system-qt"
+          fi
+          (cd deployment && bash ../script/pack_debian.sh "$GITHUB_REF_NAME" "${{ matrix.arch }}" $SYSTEMQT)
+          mv deployment/Throned.deb "packages/Throned-${GITHUB_REF_NAME}-debian-${{ matrix.arch }}${NAME_SUFFIX}.deb"
+          rm -rf deployment/Throned
+          (cd deployment && bash ../script/pack_rpm.sh "$GITHUB_REF_NAME" "${{ matrix.arch }}" $SYSTEMQT)
+          mv deployment/Throned.rpm "packages/Throned-${GITHUB_REF_NAME}-${{ matrix.arch }}${NAME_SUFFIX}.rpm"
+      - uses: actions/upload-artifact@v7.0.1
+        if: github.ref_type == 'tag'
+        with:
+          name: throned-${{ github.sha }}-packages-${{ env.DEST_SUFFIX }}
+          path: packages
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: throned-${{ github.sha }}-${{ env.DEST_SUFFIX }}
+          path: deployment/${{ env.DEST_SUFFIX }}
+
+  release:
+    if: github.ref_type == 'tag'
+    needs:
+      - windows
+      - linux
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: throned-${{ github.sha }}-windows-amd64
+          path: deployment/windows-amd64
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: throned-${{ github.sha }}-linux-*
+          path: deployment
+          merge-multiple: false
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: throned-${{ github.sha }}-packages-*
+          path: packages
+          merge-multiple: true
+      - name: Pack release files
+        run: |
+          for artifact in deployment/throned-${GITHUB_SHA}-linux-*; do
+            suffix="${artifact#deployment/throned-${GITHUB_SHA}-}"
+            mv "$artifact" "deployment/$suffix"
+          done
+          mkdir -p package/windows/Throned package/windows-legacy/Throne package/linux-legacy/Throne
+          cp -a deployment/windows-amd64/. package/windows/Throned/
+          rm -f package/windows/Throned/Throned.pdb
+          cd package/windows
+          zip -9 -r "../../Throned-${GITHUB_REF_NAME}-windows64.zip" Throned
+          cd ../..
+          mv packages/* . 2>/dev/null || true
+          for arch in amd64 arm64; do
+            mkdir -p "package/linux-${arch}/Throned"
+            cp -a "deployment/linux-${arch}/." "package/linux-${arch}/Throned/"
+            rm -f "package/linux-${arch}/Throned/Throned.debug"
+            (cd "package/linux-${arch}" && zip -9 -r "../../Throned-${GITHUB_REF_NAME}-linux-${arch}.zip" Throned)
+          done
+          if [[ "$GITHUB_REF_NAME" == "1.1.0" ]]; then
+            cp -a package/windows/Throned/. package/windows-legacy/Throne/
+            cp -a package/linux-amd64/Throned/. package/linux-legacy/Throne/
+            cd package/windows-legacy
+            zip -9 -r "../../Throne-${GITHUB_REF_NAME}-windows64.zip" Throne
+            cd ../linux-legacy
+            zip -9 -r "../../Throne-${GITHUB_REF_NAME}-linux-amd64.zip" Throne
+          fi
+      - name: Build Windows installer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nsis
+          NUM="${GITHUB_REF_NAME#v}"
+          NUM="${NUM#V}"
+          IFS='.' read -r -a parts <<< "${NUM%%-*}"
+          makensis -NOCD \
+            -DTHRONED_X64_ONLY \
+            -DAPP_VERSION="${GITHUB_REF_NAME}" \
+            -DAPP_VERSION_MAJOR="${parts[0]:-0}" \
+            -DAPP_VERSION_MINOR="${parts[1]:-0}" \
+            -DAPP_VERSION_PATCH="${parts[2]:-0}" \
+            -DAPP_VERSION_BUILD="${parts[3]:-0}" \
+            -DOUTPUT_FILE="Throned-${GITHUB_REF_NAME}-windows64-installer.exe" \
+            script/windows_installer.nsi
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets=(
+            "Throned-${GITHUB_REF_NAME}-windows64.zip"
+            "Throned-${GITHUB_REF_NAME}-windows64-installer.exe"
+            "Throned-${GITHUB_REF_NAME}-linux-amd64.zip"
+            "Throned-${GITHUB_REF_NAME}-linux-arm64.zip"
+            "Throned-${GITHUB_REF_NAME}-debian-amd64.deb"
+            "Throned-${GITHUB_REF_NAME}-debian-amd64-system-qt.deb"
+            "Throned-${GITHUB_REF_NAME}-debian-arm64.deb"
+            "Throned-${GITHUB_REF_NAME}-debian-arm64-system-qt.deb"
+            "Throned-${GITHUB_REF_NAME}-amd64.rpm"
+            "Throned-${GITHUB_REF_NAME}-amd64-system-qt.rpm"
+            "Throned-${GITHUB_REF_NAME}-arm64.rpm"
+            "Throned-${GITHUB_REF_NAME}-arm64-system-qt.rpm"
+          )
+          if [[ "$GITHUB_REF_NAME" == "1.1.0" ]]; then
+            assets=(
+              "Throne-${GITHUB_REF_NAME}-windows64.zip"
+              "Throne-${GITHUB_REF_NAME}-linux-amd64.zip"
+              "${assets[@]}"
+            )
+          fi
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release.md
